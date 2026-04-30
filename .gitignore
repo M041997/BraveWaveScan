@@ -6,3 +6,6 @@ __pycache__/
 
 # personal data — user's anatomical brain scans
 *.stl
+
+# personal data — recorded EEG / PPG sessions
+sessions/
