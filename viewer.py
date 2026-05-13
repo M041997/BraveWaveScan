@@ -27,6 +27,11 @@ BANDS = [
 BANDPASS = (1.0, 45.0)
 TRACE_COLOR = "#4ec9b0"  # neutral cyan for all traces
 
+# EMG-quality heuristic: HF/LF = power(15-45Hz) / power(1-15Hz)
+# < 0.7 = clean cortical signal; > 2.5 = facial-muscle contamination
+HF_LF_GOOD = 0.7
+HF_LF_BAD = 2.5
+
 def main():
     print("Resolving Muse EEG stream...")
     streams = resolve_byprop("type", "EEG", timeout=10)
@@ -52,17 +57,27 @@ def main():
     root.setContentsMargins(0, 0, 0, 0)
     root.setSpacing(0)
 
-    # legend bar — fixed band colors, shown once
+    # top bar: bands legend + per-channel signal quality dots
+    top_bar = QtWidgets.QWidget()
+    top_bar.setStyleSheet("background:#0a0a0a;")
+    top_layout = QtWidgets.QHBoxLayout(top_bar)
+    top_layout.setContentsMargins(8, 4, 8, 4)
+
     legend = QtWidgets.QLabel()
-    legend.setStyleSheet("background:#0a0a0a; padding:8px;")
-    legend_html = "<span style='color:#888'>brainwave bands: </span>"
+    legend_html = "<span style='color:#888'>bands: </span>"
     for name, lo, hi, (r, g, b) in BANDS:
         color = f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
         legend_html += (f"<span style='color:{color}; font-weight:600'>"
                         f"{name}</span><span style='color:#666'> ({lo}-{hi}Hz)  </span>")
     legend.setText(legend_html)
-    legend.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-    root.addWidget(legend)
+    top_layout.addWidget(legend)
+    top_layout.addStretch(1)
+
+    # quality readouts per channel
+    quality_label = QtWidgets.QLabel()
+    quality_label.setText("<span style='color:#888'>signal quality: collecting...</span>")
+    top_layout.addWidget(quality_label)
+    root.addWidget(top_bar)
 
     glw = pg.GraphicsLayoutWidget()
     glw.setBackground("#0a0a0a")
@@ -124,6 +139,28 @@ def main():
                 power = np.trapezoid(psd[i, m], f[m]) if m.any() else 1e-12
                 h = 10 * np.log10(max(power, 1e-12))
                 band_bars[i][j].setOpts(height=[h])
+
+        # signal-quality dots — HF/LF ratio per channel
+        lf_m = (f >= 1) & (f < 15)
+        hf_m = (f >= 15) & (f < 45)
+        ratios = []
+        for i in range(n_eeg):
+            lf = float(np.trapezoid(psd[i, lf_m], f[lf_m]))
+            hf = float(np.trapezoid(psd[i, hf_m], f[hf_m]))
+            ratios.append(hf / max(lf, 1e-12))
+        ch_short = ["TP9", "AF7", "AF8", "TP10"]
+        parts = ["<span style='color:#888'>signal: </span>"]
+        for i, (name, r) in enumerate(zip(ch_short, ratios)):
+            if r < HF_LF_GOOD:
+                col = "#3acb6b"; tag = ""
+            elif r > HF_LF_BAD:
+                col = "#e64a4a"; tag = " EMG!"
+            else:
+                col = "#e0c040"; tag = ""
+            parts.append(
+                f"<span style='color:{col}; font-weight:600'>● {name}</span>"
+                f"<span style='color:#666'> {r:.2f}{tag}  </span>")
+        quality_label.setText("".join(parts))
 
     win.show()
     timer = QtCore.QTimer()

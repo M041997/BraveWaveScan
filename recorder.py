@@ -21,6 +21,9 @@ from PyQt6 import QtWidgets, QtCore
 SESSIONS_DIR = Path.home() / "eeg-muse" / "sessions"
 EEG_HEADER = ["timestamp", "tp9", "af7", "af8", "tp10", "aux"]
 PPG_HEADER = ["timestamp", "ambient", "ir", "red"]
+EVENTS_HEADER = ["timestamp", "elapsed_s", "label"]
+QUICK_LABELS = ["eyes_open", "eyes_closed", "focused", "relaxed",
+                "reading", "balloon", "meditation", "music", "idle"]
 
 
 class StreamWriter(threading.Thread):
@@ -30,18 +33,18 @@ class StreamWriter(threading.Thread):
         self.inlet = inlet
         self.path = path
         self.header = header
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.sample_count = 0
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self):
         with open(self.path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(self.header)
             n_data_cols = len(self.header) - 1
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 chunk, ts = self.inlet.pull_chunk(timeout=0.2, max_samples=256)
                 if not chunk:
                     continue
@@ -104,11 +107,47 @@ class Recorder(QtWidgets.QMainWindow):
         self.record_btn.clicked.connect(self.toggle_recording)
         layout.addWidget(self.record_btn)
 
+        # inline event labeling — quick-pick combo + free text + Mark button
+        events_row = QtWidgets.QHBoxLayout()
+        self.label_combo = QtWidgets.QComboBox()
+        self.label_combo.setEditable(True)
+        for lbl in QUICK_LABELS:
+            self.label_combo.addItem(lbl)
+        self.label_combo.setCurrentText("")
+        self.label_combo.setStyleSheet(
+            "color:#ddd; background:#1a1a1a; padding:6px; "
+            "border:1px solid #333; border-radius:4px; font-size:10pt;")
+        self.label_combo.lineEdit().returnPressed.connect(self.mark_event)
+        events_row.addWidget(self.label_combo, 1)
+        self.mark_btn = QtWidgets.QPushButton("⌅ Mark Event")
+        self.mark_btn.setStyleSheet(
+            "background:#2a4d6e; color:#fff; padding:8px 14px; "
+            "border-radius:4px; border:none; font-size:10pt; font-weight:600;")
+        self.mark_btn.clicked.connect(self.mark_event)
+        self.mark_btn.setEnabled(False)
+        events_row.addWidget(self.mark_btn)
+        layout.addLayout(events_row)
+
+        # recent events list (last 6)
+        self.events_log = QtWidgets.QLabel("")
+        self.events_log.setStyleSheet(
+            "color:#888; font-size:9pt; padding:4px 8px; "
+            "background:#0e0e0e; border-radius:4px;")
+        self.events_log.setWordWrap(True)
+        self.events_log.setMinimumHeight(70)
+        self.events_log.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.events_log)
+
         # session path display
         self.path_label = QtWidgets.QLabel("")
         self.path_label.setStyleSheet("color:#666; font-size:9pt;")
         self.path_label.setWordWrap(True)
         layout.addWidget(self.path_label)
+
+        # event log state
+        self._events = []          # list of (elapsed_s, label) for UI
+        self._events_csv = None    # open file handle while recording
 
         # 1Hz UI tick
         self.tick = QtCore.QTimer(self)
@@ -164,10 +203,19 @@ class Recorder(QtWidgets.QMainWindow):
             self.ppg_writer = StreamWriter(
                 self.ppg_inlet, self.session_dir / "ppg.csv", PPG_HEADER)
             self.ppg_writer.start()
+        # events file
+        self._events = []
+        self._events_csv = open(self.session_dir / "events.csv", "w",
+                                newline="")
+        self._events_writer = csv.writer(self._events_csv)
+        self._events_writer.writerow(EVENTS_HEADER)
+        self._events_csv.flush()
+        self.mark_btn.setEnabled(True)
         self.record_btn.setText("■ STOP RECORDING")
         self.record_btn.setStyleSheet(self._btn_style_recording())
         self.path_label.setText(f"writing to: {self.session_dir}")
         self.notes.setEnabled(True)
+        self._render_events()
 
     def stop_recording(self):
         elapsed = time.time() - self.start_time
@@ -177,6 +225,11 @@ class Recorder(QtWidgets.QMainWindow):
             self.eeg_writer.stop(); self.eeg_writer.join(timeout=2)
         if self.ppg_writer:
             self.ppg_writer.stop(); self.ppg_writer.join(timeout=2)
+        n_events = len(self._events)
+        if self._events_csv is not None:
+            self._events_csv.close()
+            self._events_csv = None
+        self.mark_btn.setEnabled(False)
 
         meta = {
             "start": datetime.fromtimestamp(self.start_time).isoformat(),
@@ -184,6 +237,7 @@ class Recorder(QtWidgets.QMainWindow):
             "duration_s": round(elapsed, 2),
             "eeg_samples": eeg_n,
             "ppg_samples": ppg_n,
+            "events": n_events,
             "notes": self.notes.text(),
         }
         with open(self.session_dir / "meta.json", "w") as f:
@@ -194,7 +248,39 @@ class Recorder(QtWidgets.QMainWindow):
         self.record_btn.setText("● START RECORDING")
         self.record_btn.setStyleSheet(self._btn_style_idle())
         self.path_label.setText(
-            f"saved {eeg_n + ppg_n:,} samples to {self.session_dir.name}/")
+            f"saved {eeg_n + ppg_n:,} samples + {n_events} events to "
+            f"{self.session_dir.name}/")
+
+    def mark_event(self):
+        if self._events_csv is None or self.start_time is None:
+            return
+        label = self.label_combo.currentText().strip()
+        if not label:
+            return
+        elapsed = time.time() - self.start_time
+        ts = time.time()
+        self._events_writer.writerow([f"{ts:.6f}", f"{elapsed:.3f}", label])
+        self._events_csv.flush()
+        self._events.append((elapsed, label))
+        self._render_events()
+        self.label_combo.setCurrentText("")
+
+    def _render_events(self):
+        if not self._events:
+            self.events_log.setText(
+                "<span style='color:#666'>events: type a label "
+                "and press Enter (or click Mark Event) to timestamp the moment</span>")
+            return
+        # show last 6
+        rows = []
+        for elapsed, label in self._events[-6:]:
+            mm, ss = divmod(int(elapsed), 60)
+            rows.append(f"<span style='color:#bbb'>"
+                        f"{mm:02d}:{ss:02d}</span> "
+                        f"<span style='color:#7dd8a8'>{label}</span>")
+        self.events_log.setText(
+            f"<span style='color:#888'>{len(self._events)} events  </span>"
+            + "  ·  ".join(rows))
 
     def refresh_ui(self):
         if self.start_time is not None and self.eeg_writer is not None:
