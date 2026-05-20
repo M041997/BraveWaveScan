@@ -6,6 +6,7 @@ Left column: filtered EEG trace per channel (channel name labels what you're see
 Right column: power per brainwave BAND. Each band gets a fixed semantic color,
             shared across all 4 channels. Same color = same band, everywhere.
 """
+import argparse
 import sys
 import numpy as np
 from pylsl import StreamInlet, resolve_byprop
@@ -15,6 +16,8 @@ from scipy.signal import butter, sosfiltfilt, welch
 
 WINDOW_SEC = 5.0
 PSD_WINDOW_SEC = 2.0
+BLINK_WINDOW_SEC = 0.35
+MAX_BLINK_HOLD_SEC = 0.35
 EEG_CHANNELS = ["TP9 (left ear)", "AF7 (left forehead)",
                 "AF8 (right forehead)", "TP10 (right ear)"]
 BANDS = [
@@ -32,7 +35,46 @@ TRACE_COLOR = "#4ec9b0"  # neutral cyan for all traces
 HF_LF_GOOD = 0.7
 HF_LF_BAD = 2.5
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Live Muse 2 EEG viewer.")
+    parser.add_argument(
+        "--ignore-blinks",
+        action="store_true",
+        help="Hold waveforms and readouts steady during likely blink artifacts.",
+    )
+    return parser.parse_args()
+
+
+def is_blink(filt, srate):
+    blink_len = min(filt.shape[1], int(BLINK_WINDOW_SEC * srate))
+    if blink_len <= 0:
+        return False
+
+    recent = filt[:, -blink_len:]
+    front = recent[1:3]
+    temporal = recent[[0, 3]]
+
+    # Blinks are slow, large swings that should hit AF7/AF8 harder than TP9/TP10.
+    # Avoid treating rhythmic pulse/contact drift as blink just because it moves
+    # all channels together.
+    front_ptp = np.ptp(front, axis=1)
+    temporal_ptp = np.ptp(temporal, axis=1)
+    front_common_ptp = float(np.ptp(front.mean(axis=0)))
+    temporal_common_ptp = max(float(np.ptp(temporal.mean(axis=0))), 1.0)
+    front_slope = float(np.max(np.abs(np.diff(front.mean(axis=0))))) * srate
+
+    frontal_blink = (
+        front_common_ptp > 220.0
+        and front_common_ptp > temporal_common_ptp * 1.35
+        and bool(np.all(front_ptp > 140.0))
+        and bool(np.any(front_ptp > temporal_ptp * 1.25))
+        and front_slope > 1200.0
+    )
+    return frontal_blink
+
+
 def main():
+    args = parse_args()
     print("Resolving Muse EEG stream...")
     streams = resolve_byprop("type", "EEG", timeout=10)
     if not streams:
@@ -45,6 +87,7 @@ def main():
     buf_len = int(WINDOW_SEC * srate)
     psd_len = int(PSD_WINDOW_SEC * srate)
     buf = np.zeros((n_eeg, buf_len), dtype=np.float32)
+    clean_buf = np.zeros((n_eeg, buf_len), dtype=np.float32)
     sos = butter(4, BANDPASS, btype="bandpass", fs=srate, output="sos")
 
     app = QtWidgets.QApplication(sys.argv)
@@ -74,6 +117,12 @@ def main():
     top_layout.addStretch(1)
 
     # quality readouts per channel
+    artifact_label = QtWidgets.QLabel()
+    artifact_label.setText(
+        "<span style='color:#666'>blink filter: "
+        f"{'on' if args.ignore_blinks else 'off'}</span>")
+    top_layout.addWidget(artifact_label)
+
     quality_label = QtWidgets.QLabel()
     quality_label.setText("<span style='color:#888'>signal quality: collecting...</span>")
     top_layout.addWidget(quality_label)
@@ -102,7 +151,9 @@ def main():
         # right: per-band bars; each band has its own color
         bp = glw.addPlot(row=i, col=1)
         bp.setLabel("left", "power (dB)")
-        bp.setYRange(0, 40)
+        # Muse units are not calibrated volts, so live band power can run above
+        # 40 dB when contact is noisy. Keep the full bar visible for diagnosis.
+        bp.setYRange(-10, 60)
         bp.showGrid(x=False, y=True, alpha=0.2)
         # one BarGraphItem per band so we can color each independently
         bars = []
@@ -119,6 +170,7 @@ def main():
 
     glw.ci.layout.setColumnStretchFactor(0, 3)
     glw.ci.layout.setColumnStretchFactor(1, 1)
+    blink_state = {"accepted": 0, "held": 0, "last_filt": None}
 
     def update():
         chunk, _ = inlet.pull_chunk(timeout=0.0, max_samples=256)
@@ -128,9 +180,36 @@ def main():
         n = arr.shape[1]
         buf[:, :-n] = buf[:, n:]
         buf[:, -n:] = arr
-        filt = sosfiltfilt(sos, buf, axis=1).astype(np.float32)
+        raw_filt = sosfiltfilt(sos, buf, axis=1).astype(np.float32)
+
+        can_ignore = (
+            args.ignore_blinks
+            and blink_state["accepted"] >= psd_len
+            and blink_state["held"] < int(MAX_BLINK_HOLD_SEC * srate)
+        )
+        if can_ignore and is_blink(raw_filt, srate):
+            blink_state["held"] += n
+            artifact_label.setText(
+                "<span style='color:#e0c040; font-weight:600'>blink ignored</span>")
+            if blink_state["last_filt"] is not None:
+                for i, c in enumerate(trace_curves):
+                    c.setData(x, blink_state["last_filt"][i])
+            return
+        else:
+            clean_buf[:, :-n] = clean_buf[:, n:]
+            clean_buf[:, -n:] = arr
+            blink_state["accepted"] += n
+            blink_state["held"] = 0
+            if args.ignore_blinks:
+                artifact_label.setText(
+                    "<span style='color:#3acb6b'>blink filter: on</span>")
+
+        display_buf = clean_buf if args.ignore_blinks else buf
+        filt = sosfiltfilt(sos, display_buf, axis=1).astype(np.float32)
+        blink_state["last_filt"] = filt
         for i, c in enumerate(trace_curves):
             c.setData(x, filt[i])
+
         seg = filt[:, -psd_len:]
         f, psd = welch(seg, fs=srate, nperseg=min(256, psd_len), axis=1)
         for i in range(n_eeg):
