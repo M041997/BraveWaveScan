@@ -14,7 +14,11 @@ import sys
 import math
 import random
 import time
+import csv
+import json
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 import numpy as np
 from pylsl import StreamInlet, resolve_byprop
 from PyQt6 import QtWidgets, QtCore, QtGui
@@ -43,6 +47,14 @@ Z_LO, Z_HI = -0.5, 2.2
 HF_LF_GOOD = 0.7   # weight = 1.0 below this
 HF_LF_BAD = 2.5    # weight = 0.0 above this
 QUALITY_EMA = 0.15 # smoothing on per-channel HF/LF ratio
+
+FOCUS_SESSIONS_DIR = Path.home() / "eeg-muse" / "focus_sessions"
+LOG_HEADER = [
+    "lsl_ts", "wall_ts", "elapsed_s", "phase",
+    "z", "ema_log_ratio", "baseline_median", "baseline_mad",
+    "w_af7", "w_af8", "hflf_af7", "hflf_af8",
+    "balloon_pct", "hold_pct", "alive", "event",
+]
 
 BALLOON_COLORS = [
     (0.95, 0.30, 0.35),  # red
@@ -360,6 +372,32 @@ class FocusBalloon(QtWidgets.QMainWindow):
         # per-channel EMG-quality smoothing: maps frontal channel idx -> EMA HF/LF ratio
         self.hf_lf_ema = {}
 
+        # session logging — focus_log.csv joinable to any concurrent
+        # recorder.py eeg.csv via the LSL timestamp column
+        ts_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.session_dir = FOCUS_SESSIONS_DIR / ts_stamp
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.session_dir / "focus_log.csv"
+        self.log_fh = open(self.log_path, "w", newline="")
+        self.log_writer = csv.writer(self.log_fh)
+        self.log_writer.writerow(LOG_HEADER)
+        self.log_fh.flush()
+        self._last_pop_count = 0
+        self._wall_start = time.time()
+        meta = {
+            "start": datetime.fromtimestamp(self._wall_start).isoformat(),
+            "config": {
+                "Z_LO": Z_LO, "Z_HI": Z_HI,
+                "POP_HOLD_SEC": POP_HOLD_SEC,
+                "HF_LF_GOOD": HF_LF_GOOD, "HF_LF_BAD": HF_LF_BAD,
+                "warmup_sec": 20.0,
+                "frontal_channels": ["AF7", "AF8"],
+            },
+        }
+        with open(self.session_dir / "meta.json", "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"logging session to: {self.session_dir}")
+
         # timers
         self.eeg_timer = QtCore.QTimer(self)
         self.eeg_timer.timeout.connect(self.pull_and_score)
@@ -369,16 +407,73 @@ class FocusBalloon(QtWidgets.QMainWindow):
         self.draw_timer.timeout.connect(self.canvas.tick)
         self.draw_timer.start(16)  # ~60 fps
 
+    def _fnum(self, v):
+        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            return ""
+        return f"{v:.6f}"
+
+    def _log_row(self, lsl_ts, phase, *, z=None, ema=None,
+                 base_med=None, base_mad=None, weights=None, qsmooth=None,
+                 event=""):
+        elapsed = time.monotonic() - (self.start_t or time.monotonic())
+        balloon_pct = 100.0 * (self.canvas.balloon_radius - BALLOON_MIN_R) \
+            / max(BALLOON_MAX_R - BALLOON_MIN_R, 1)
+        hold_pct = 100.0 * self.canvas.full_hold / POP_HOLD_SEC
+        w_af7 = weights[0] if weights else None
+        w_af8 = weights[1] if weights else None
+        h_af7 = qsmooth[0] if qsmooth else None
+        h_af8 = qsmooth[1] if qsmooth else None
+        self.log_writer.writerow([
+            self._fnum(lsl_ts),
+            self._fnum(time.time()),
+            f"{elapsed:.3f}",
+            phase,
+            self._fnum(z), self._fnum(ema),
+            self._fnum(base_med), self._fnum(base_mad),
+            self._fnum(w_af7), self._fnum(w_af8),
+            self._fnum(h_af7), self._fnum(h_af8),
+            f"{max(0, balloon_pct):.2f}",
+            f"{min(100, max(0, hold_pct)):.2f}",
+            int(self.canvas.alive),
+            event,
+        ])
+        self.log_fh.flush()
+
+    def _check_pop_event(self):
+        c = self.canvas.pop_count
+        if c > self._last_pop_count:
+            self._last_pop_count = c
+            return "pop"
+        return ""
+
+    def closeEvent(self, ev):
+        try:
+            if self.log_fh and not self.log_fh.closed:
+                self.log_fh.close()
+            # update meta with end + total pops
+            meta_path = self.session_dir / "meta.json"
+            if meta_path.exists():
+                meta = json.load(open(meta_path))
+                meta["end"] = datetime.now().isoformat()
+                meta["duration_s"] = round(time.time() - self._wall_start, 2)
+                meta["total_pops"] = self.canvas.pop_count
+                json.dump(meta, open(meta_path, "w"), indent=2)
+        except Exception:
+            pass
+        super().closeEvent(ev)
+
     def pull_and_score(self):
-        chunk, _ = self.inlet.pull_chunk(timeout=0.0, max_samples=256)
+        chunk, ts_list = self.inlet.pull_chunk(timeout=0.0, max_samples=256)
         if not chunk:
             return
+        lsl_ts = float(ts_list[-1]) if ts_list else float("nan")
         arr = np.asarray(chunk, dtype=np.float32).T[:N_EEG]
         n = arr.shape[1]
         self.buf[:, :-n] = self.buf[:, n:]
         self.buf[:, -n:] = arr
         self.samples_seen += n
         if self.samples_seen < self.warmup_target:
+            self._log_row(lsl_ts, "buffering")
             return
 
         filt = sosfiltfilt(self.sos, self.buf, axis=1).astype(np.float32)
@@ -419,6 +514,9 @@ class FocusBalloon(QtWidgets.QMainWindow):
             self.canvas.set_focus(0.0, calibrating=False,
                                   calib_remaining=0.0,
                                   no_signal=True)
+            self._log_row(lsl_ts, "no_signal",
+                          weights=weights, qsmooth=quality_smoothed,
+                          event=self._check_pop_event())
             return
 
         beta = sum(weights[k] * ch_bp[FRONTAL_IDX[k]][2]
@@ -446,6 +544,9 @@ class FocusBalloon(QtWidgets.QMainWindow):
             remaining = self.warmup_sec - elapsed
             self.canvas.set_focus(0.0, calibrating=True,
                                   calib_remaining=remaining)
+            self._log_row(lsl_ts, "warmup",
+                          ema=self.ema_log_ratio,
+                          weights=weights, qsmooth=quality_smoothed)
             return
 
         # robust stats over the rolling window — median + scaled MAD
@@ -456,6 +557,11 @@ class FocusBalloon(QtWidgets.QMainWindow):
         z = (self.ema_log_ratio - med) / baseline_std
         z = max(-3.0, min(6.0, z))
         self.canvas.set_focus(z, calibrating=False, calib_remaining=0.0)
+        self._log_row(lsl_ts, "play",
+                      z=z, ema=self.ema_log_ratio,
+                      base_med=med, base_mad=mad,
+                      weights=weights, qsmooth=quality_smoothed,
+                      event=self._check_pop_event())
         # log live z range every ~1s so we can tune
         self._z_min = min(self._z_min, z)
         self._z_max = max(self._z_max, z)

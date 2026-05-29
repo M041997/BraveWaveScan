@@ -125,6 +125,15 @@ Live z-scores are printed to the terminal so you can tune thresholds
 (`Z_LO`, `Z_HI`, `POP_HOLD_SEC` at the top of `focus_balloon.py`) to your
 own dynamic range.
 
+Each balloon run writes a per-tick log to
+`~/eeg-muse/focus_sessions/<timestamp>/focus_log.csv` with columns
+`lsl_ts, wall_ts, elapsed_s, phase, z, ema_log_ratio, baseline_median,
+baseline_mad, w_af7, w_af8, hflf_af7, hflf_af8, balloon_pct, hold_pct,
+alive, event`. The `lsl_ts` column shares a clock with any concurrent
+`recorder.py` `eeg.csv`, so you can join the two on timestamp to see
+exactly what your EEG was doing the moment you popped a balloon
+(`event="pop"`).
+
 ## Signal-quality heuristic
 
 A few tools (`viewer.py`, `focus_balloon.py`, `session_inspector.py`) share
