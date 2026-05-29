@@ -67,6 +67,18 @@ class Session:
         self.dir = d
         meta_path = d / "meta.json"
         self.meta = json.load(open(meta_path)) if meta_path.exists() else {}
+        # events.csv (written by recorder.py): (timestamp, elapsed_s, label)
+        ev_path = d / "events.csv"
+        if ev_path.exists():
+            try:
+                edf = pd.read_csv(ev_path)
+                self.events = list(zip(
+                    edf["elapsed_s"].astype(float).tolist(),
+                    edf["label"].astype(str).tolist()))
+            except Exception:
+                self.events = []
+        else:
+            self.events = []
         df = pd.read_csv(d / "eeg.csv")
         self.t = df["timestamp"].to_numpy()
         self.t_rel = self.t - self.t[0]
@@ -161,9 +173,11 @@ class Inspector(QtWidgets.QMainWindow):
         start = m.get("start", "")
         dur = m.get("duration_s", self.sess.duration)
         n_seg = len(m.get("segments", []))
+        n_ev = len(self.sess.events)
         return (f"<b>{self.sess.dir.name}</b>  "
                 f"<span style='color:#7b86a0'>start={start} · "
                 f"duration={dur:.1f}s · {n_seg} segments · "
+                f"{n_ev} events · "
                 f"{self.sess.n_samples:,} samples</span>")
 
     # ---------- overview row (full session): segments + quality strips ----
@@ -209,6 +223,17 @@ class Inspector(QtWidgets.QMainWindow):
         for i in range(4):
             dummy = pg.PlotDataItem(pen=pg.mkPen(ch_pens[i], width=2))
             leg.addItem(dummy, CHANNEL_LABELS[i])
+
+        # event markers (vertical dashed lines + labels)
+        for elapsed, label in self.sess.events:
+            line = pg.InfiniteLine(
+                angle=90, pos=elapsed,
+                pen=pg.mkPen("#cfd6e4", width=1,
+                             style=QtCore.Qt.PenStyle.DashLine))
+            ov.addItem(line)
+            txt = pg.TextItem(label, color="#cfd6e4", anchor=(0, 1))
+            txt.setPos(elapsed + 0.5, 3.95)
+            ov.addItem(txt)
 
         # cursor (vertical line) — draggable
         self.cursor_line = pg.InfiniteLine(angle=90, pos=0,
@@ -382,6 +407,17 @@ class Inspector(QtWidgets.QMainWindow):
             if s["start_s"] <= t < s["end_s"]:
                 seg_label = s["label"]
                 break
+        # nearest event within ±10s
+        nearest_event = ""
+        if self.sess.events:
+            elapsed_arr = np.array([e[0] for e in self.sess.events])
+            idx = int(np.argmin(np.abs(elapsed_arr - t)))
+            dt = t - self.sess.events[idx][0]
+            if abs(dt) <= 10.0:
+                arrow = "←" if dt > 0 else "→"
+                nearest_event = (f"   event {arrow} "
+                                 f"<b>{self.sess.events[idx][1]}</b> "
+                                 f"({dt:+.1f}s)")
         # current quality at this t
         ti = int(np.searchsorted(self.sess.spec_t, t))
         ti = max(0, min(ti, len(self.sess.spec_t) - 1))
@@ -392,7 +428,7 @@ class Inspector(QtWidgets.QMainWindow):
                        "BAD"  if q > HF_LF_BAD  else "marg")
             parts.append(f"{CHANNELS[ch].upper()}={q:.2f} {verdict}")
         self.status.setText(
-            f"t={t:6.2f}s   segment: <b>{seg_label}</b>   "
+            f"t={t:6.2f}s   segment: <b>{seg_label}</b>{nearest_event}   "
             + "   ".join(parts))
 
 
